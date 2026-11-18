@@ -216,7 +216,7 @@ preflight() {
   mem_kb="$(awk '/MemTotal/{print $2}' /proc/meminfo)"
   cpus="$(nproc)"
   [ -d /var/lib/docker ] && path=/var/lib/docker
-  avail_gb="$(df -P -BG --output=avail "$path" | tail -n1 | tr -dc '0-9')"
+  avail_gb="$(df -BG --output=avail "$path" | tail -n1 | tr -dc '0-9')"
   info "CPU: $cpus, RAM: $((mem_kb / 1024)) МБ, свободно на диске: ${avail_gb} ГБ" \
        "CPU: $cpus, RAM: $((mem_kb / 1024)) MB, free disk: ${avail_gb} GB"
 
