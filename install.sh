@@ -47,12 +47,14 @@ die()  { say "[x] $(t "$1" "$2")"; notify "❌ nod-installer ($(hostname)): $(t 
 
 has_tty() { ( : </dev/tty ) 2>/dev/null; }
 
-# ask "ru" "en" default(y|n) -> 0 = да/yes
+# ask "ru" "en" -> 0 = explicit yes; empty/unknown input repeats the question.
 ask() {
-  local def="${3:-n}" a hint="y/N"
+  local a hint="y/n"
   if [ "$ASSUME_YES" = 1 ]; then return 0; fi
-  if ! has_tty; then [ "$def" = y ]; return; fi
-  [ "$def" = y ] && hint="Y/n"
+  if ! has_tty; then
+    die "Для подтверждения нужен терминал. Для явного согласия без терминала используйте --yes." \
+        "Confirmation requires a terminal. Use --yes for explicit noninteractive consent."
+  fi
   while true; do
     if ! IFS= read -r -p "$(t "$1" "$2") [$hint] " a </dev/tty; then
       die "Не удалось прочитать ответ из терминала" "Could not read an answer from the terminal"
@@ -65,11 +67,10 @@ ask() {
     a="${a// / }"
     a="${a#"${a%%[![:space:]]*}"}"
     a="${a%"${a##*[![:space:]]}"}"
-    a="${a:-$def}"
     case "${a,,}" in
       y|yes|да|д) return 0 ;;
       n|no|нет|н) return 1 ;;
-      *) printf '%s\n' "$(t 'Введите y (да) или n (нет); Enter — ответ по умолчанию.' 'Enter y (yes) or n (no); Enter uses the default.')" >/dev/tty ;;
+      *) printf '%s\n' "$(t 'Введите y (да) или n (нет). Пустой ввод не принимается.' 'Enter y (yes) or n (no). Empty input is not accepted.')" >/dev/tty ;;
     esac
   done
 }
