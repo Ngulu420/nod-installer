@@ -4,7 +4,7 @@
 #                 install & operate Nod (n8n-io/nod) on a VPS in one command
 #
 # Установка / Install (Debian/Ubuntu, root):
-#   curl -fsSL https://raw.githubusercontent.com/Ngulu420/nod-installer/main/install.sh | sudo bash
+#   curl https://raw.githubusercontent.com/Ngulu420/nod-installer/main/install.sh | sudo bash
 #   curl -fsSL .../install.sh | sudo bash -s -- --domain nod.example.ru     # HTTPS (Caddy)
 #
 # Потом / Afterwards:  nod-installer {status|backup|update|rotate-token}
@@ -53,9 +53,25 @@ ask() {
   if [ "$ASSUME_YES" = 1 ]; then return 0; fi
   if ! has_tty; then [ "$def" = y ]; return; fi
   [ "$def" = y ] && hint="Y/n"
-  read -r -p "$(t "$1" "$2") [$hint] " a </dev/tty || a=""
-  a="${a:-$def}"
-  case "$a" in y|Y|yes|YES|да|Да|д|Д) return 0 ;; *) return 1 ;; esac
+  while true; do
+    if ! IFS= read -r -p "$(t "$1" "$2") [$hint] " a </dev/tty; then
+      die "Не удалось прочитать ответ из терминала" "Could not read an answer from the terminal"
+    fi
+    # Some SSH clients include CR or bracketed-paste markers in pasted input.
+    a="${a//$'\r'/}"
+    a="${a//$'\e[200~'/}"
+    a="${a//$'\e[201~'/}"
+    a="${a// / }"
+    a="${a// / }"
+    a="${a#"${a%%[![:space:]]*}"}"
+    a="${a%"${a##*[![:space:]]}"}"
+    a="${a:-$def}"
+    case "${a,,}" in
+      y|yes|да|д) return 0 ;;
+      n|no|нет|н) return 1 ;;
+      *) printf '%s\n' "$(t 'Введите y (да) или n (нет); Enter — ответ по умолчанию.' 'Enter y (yes) or n (no); Enter uses the default.')" >/dev/tty ;;
+    esac
+  done
 }
 
 # Алерт в Telegram (токен не попадает в аргументы процесса)
@@ -231,8 +247,8 @@ preflight() {
 ensure_docker() {
   info "Установка базовых пакетов" "Installing base packages"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq >>"$LOG_FILE" 2>&1
-  apt-get install -y -qq ca-certificates curl git openssl util-linux gnupg >>"$LOG_FILE" 2>&1
+  apt-get update 2>&1 | tee -a "$LOG_FILE"
+  apt-get install -y ca-certificates curl git openssl util-linux gnupg 2>&1 | tee -a "$LOG_FILE"
 
   if ! command -v docker >/dev/null 2>&1; then
     info "Docker не найден — ставлю из официального репозитория Docker" "Docker not found — installing from the official Docker repository"
@@ -244,15 +260,15 @@ ensure_docker() {
     fi
     [ -n "$codename" ] || die "Не удалось определить кодовое имя релиза" "Cannot detect the release codename"
     install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL "https://download.docker.com/linux/$distro/gpg" -o /etc/apt/keyrings/docker.asc
+    curl -fL "https://download.docker.com/linux/$distro/gpg" -o /etc/apt/keyrings/docker.asc
     chmod a+r /etc/apt/keyrings/docker.asc
     printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n' \
       "$(dpkg --print-architecture)" "$distro" "$codename" >/etc/apt/sources.list.d/docker.list
-    apt-get update -qq >>"$LOG_FILE" 2>&1
-    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >>"$LOG_FILE" 2>&1
+    apt-get update 2>&1 | tee -a "$LOG_FILE"
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>&1 | tee -a "$LOG_FILE"
   fi
 
-  if command -v systemctl >/dev/null 2>&1; then systemctl enable --now docker >>"$LOG_FILE" 2>&1 || true; fi
+  if command -v systemctl >/dev/null 2>&1; then systemctl enable --now docker 2>&1 | tee -a "$LOG_FILE" || true; fi
   docker info >/dev/null 2>&1 || die "Docker не запущен" "Docker is not running"
   docker compose version >/dev/null 2>&1 || die "Нужен Docker Compose v2 (плагин docker-compose-plugin)" "Docker Compose v2 plugin is required"
 
@@ -277,14 +293,15 @@ resolve_ref() {
 }
 
 fetch_source() {
+  info "Загрузка исходников Nod" "Downloading Nod source"
   if [ -d "$SRC_DIR/.git" ]; then
-    git -C "$SRC_DIR" fetch --tags --force --quiet origin >>"$LOG_FILE" 2>&1
+    git -C "$SRC_DIR" fetch --tags --force --progress origin 2>&1 | tee -a "$LOG_FILE"
   else
-    git clone --quiet "$NOD_REPO" "$SRC_DIR" >>"$LOG_FILE" 2>&1
+    git clone --progress "$NOD_REPO" "$SRC_DIR" 2>&1 | tee -a "$LOG_FILE"
   fi
   git -C "$SRC_DIR" rev-parse --verify --quiet "${REF}^{commit}" >/dev/null \
     || die "Тег/коммит '$REF' не найден в репозитории" "Tag/commit '$REF' not found in the repository"
-  git -C "$SRC_DIR" checkout --quiet --detach "$REF" >>"$LOG_FILE" 2>&1
+  git -C "$SRC_DIR" checkout --detach "$REF" 2>&1 | tee -a "$LOG_FILE"
   [ -f "$COMPOSE_DIR/setup.sh" ] \
     || die "В $COMPOSE_DIR нет setup.sh — структура репозитория изменилась, сверьтесь с документацией" \
            "No setup.sh in $COMPOSE_DIR — repo layout changed, check the docs"
@@ -378,7 +395,7 @@ prepare_env() {
   fi
 
   info "Генерация конфигурации (setup.sh)" "Generating configuration (setup.sh)"
-  ( cd "$COMPOSE_DIR" && sh setup.sh </dev/null ) >>"$LOG_FILE" 2>&1 \
+  ( cd "$COMPOSE_DIR" && sh setup.sh </dev/null ) 2>&1 | tee -a "$LOG_FILE" \
     || die "setup.sh завершился с ошибкой, см. $LOG_FILE" "setup.sh failed, see $LOG_FILE"
   [ -f "$ENV_FILE" ] || die ".env не создан" ".env was not created"
   chmod 600 "$ENV_FILE"
@@ -407,17 +424,41 @@ prepare_env() {
 
 # ---- Сборка и проверка ----------------------------------------------------------
 run_build() {
-  local status="$INSTALL_DIR/.build-status" waited=0 limit=2700 rc
+  local status="$INSTALL_DIR/.build-status" waited=0 limit=2700 rc build_pid viewer_pid
   rm -f "$status"; : >"$BUILD_LOG"; chmod 600 "$BUILD_LOG"
   info "Сборка и запуск (первый раз ~12+ мин). Лог: $BUILD_LOG. Если SSH оборвётся — сборка продолжится." \
        "Building and starting (first run ~12+ min). Log: $BUILD_LOG. If SSH drops, the build continues."
-  setsid nohup bash -c "cd '$COMPOSE_DIR' && docker compose $PROFILE_STR up -d --build --wait; echo \$? >'$status'" \
+  # Keep the builder independent of SSH; stream its log to this terminal.
+  setsid nohup bash -c '
+    cd "$1" || { printf "%s\n" "$?" >"$2"; exit 1; }
+    export BUILDKIT_PROGRESS=plain
+    if [ -n "$3" ]; then
+      docker compose --progress plain --profile https up -d --build --wait
+    else
+      docker compose --progress plain up -d --build --wait
+    fi
+    rc=$?
+    printf "%s\n" "$rc" >"$2"
+    exit "$rc"
+  ' bash "$COMPOSE_DIR" "$status" "$PROFILE_STR" \
     >>"$BUILD_LOG" 2>&1 </dev/null &
+  build_pid=$!
+  tail --pid="$build_pid" --sleep-interval=0.2 -n +1 -f "$BUILD_LOG" &
+  viewer_pid=$!
   while [ ! -f "$status" ]; do
-    sleep 10; waited=$((waited + 10))
-    if [ $((waited % 60)) -eq 0 ]; then info "… ${waited} с" "… ${waited}s"; fi
-    if [ "$waited" -ge "$limit" ]; then die "Таймаут сборки (45 мин). Смотрите $BUILD_LOG" "Build timeout (45 min). See $BUILD_LOG"; fi
+    sleep 2; waited=$((waited + 2))
+    if [ $((waited % 60)) -eq 0 ]; then
+      info "Сборка продолжается: прошло ${waited} с" "Build still running: ${waited}s elapsed"
+    fi
+    if [ "$waited" -ge "$limit" ]; then
+      kill "$viewer_pid" 2>/dev/null || true
+      wait "$viewer_pid" 2>/dev/null || true
+      die "Таймаут ожидания сборки (45 мин). Сборка продолжает работать; лог: $BUILD_LOG" \
+          "Build wait timed out (45 min). Builder is still running; log: $BUILD_LOG"
+    fi
   done
+  wait "$viewer_pid" || true
+  wait "$build_pid" || true
   rc="$(cat "$status")"
   if [ "$rc" != 0 ]; then
     tail -n 40 "$BUILD_LOG" | tee -a "$LOG_FILE" || true
@@ -439,6 +480,7 @@ wait_http() { # url tries
 verify() {
   local port; port="$(get_env PORT)"; port="${port:-4310}"
   dc ps 2>&1 | tee -a "$LOG_FILE" || true
+  info "Проверка ответа Nod на 127.0.0.1:$port" "Checking Nod at 127.0.0.1:$port"
   wait_http "http://127.0.0.1:$port/" 24 \
     || die "Nod не отвечает на 127.0.0.1:$port. Логи: docker compose logs --tail 100 server" \
            "Nod does not answer on 127.0.0.1:$port. Logs: docker compose logs --tail 100 server"
@@ -528,10 +570,13 @@ cmd_install() {
   fi
   set_mode
 
+  if ! ask "Начать установку Nod?" "Start installing Nod?" n; then
+    die "Установка отменена пользователем" "Installation cancelled by the user"
+  fi
   preflight
   ensure_docker
   resolve_ref
-  if ! ask "Установить версию $REF из $NOD_REPO?" "Install version $REF from $NOD_REPO?" y; then die "Отменено" "Cancelled"; fi
+  info "Устанавливаю версию $REF из $NOD_REPO" "Installing version $REF from $NOD_REPO"
   if [ "$MODE" = https ]; then check_domain; fi
 
   fetch_source
@@ -575,7 +620,7 @@ cmd_backup() {
   [ ! -e "$dest" ] || die "$dest уже существует" "$dest already exists"
   mkdir -p "$(dirname "$dest")"; chmod 700 "$(dirname "$dest")" 2>/dev/null || true
   warn "На время копирования сервер, браузер и workspace будут остановлены" "Server, browser and workspace are stopped while copying"
-  ( cd "$COMPOSE_DIR" && sh backup.sh "$dest" ) >>"$LOG_FILE" 2>&1 \
+  ( cd "$COMPOSE_DIR" && sh backup.sh "$dest" ) 2>&1 | tee -a "$LOG_FILE" \
     || die "backup.sh завершился с ошибкой, см. $LOG_FILE" "backup.sh failed, see $LOG_FILE"
   [ -f "$dest/complete" ] || die "Бэкап неполный (нет маркера complete)" "Backup incomplete (missing 'complete' marker)"
   chmod -R go-rwx "$dest"
@@ -598,7 +643,7 @@ cmd_update() {
 
   POS1=""; cmd_backup
   info "Останавливаю стек" "Stopping the stack"
-  dc stop >>"$LOG_FILE" 2>&1
+  dc stop 2>&1 | tee -a "$LOG_FILE"
   fetch_source
   run_build
   verify
@@ -613,7 +658,7 @@ cmd_rotate_token() {
            "Replace NOD_AUTH_TOKEN? All clients lose access until the new token is entered" n; then die "Отменено" "Cancelled"; fi
   cp -p "$ENV_FILE" "$ENV_FILE.bak.$(date +%Y%m%d-%H%M%S)"
   set_env NOD_AUTH_TOKEN "$(openssl rand -hex 32)"
-  dc up -d --wait server >>"$LOG_FILE" 2>&1 || die "Не удалось перезапустить server" "Could not restart server"
+  dc up -d --wait server 2>&1 | tee -a "$LOG_FILE" || die "Не удалось перезапустить server" "Could not restart server"
   ok "Токен заменён. NOD_VAULT_KEY не менялся (и менять его нельзя)" "Token replaced. NOD_VAULT_KEY untouched (never change it)"
   show_token
 }
@@ -637,3 +682,4 @@ main() {
 }
 
 main "$@"
+
