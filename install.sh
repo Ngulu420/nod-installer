@@ -245,11 +245,22 @@ preflight() {
   [ "${avail_gb:-0}" -ge 50 ] || warn "Рекомендуется 50 ГБ диска: сборка и данные занимают много места" "50 GB disk recommended: build and data need a lot of space"
 }
 
+apt_run() {
+  apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 \
+    -o Acquire::https::Timeout=30 "$@" 2>&1 | tee -a "$LOG_FILE"
+}
+
 ensure_docker() {
-  info "Установка базовых пакетов" "Installing base packages"
+  local base_packages=(ca-certificates curl git openssl util-linux gnupg)
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update 2>&1 | tee -a "$LOG_FILE"
-  apt-get install -y ca-certificates curl git openssl util-linux gnupg 2>&1 | tee -a "$LOG_FILE"
+  if dpkg-query -W -f='${db:Status-Status}\n' "${base_packages[@]}" 2>/dev/null \
+      | awk '$0 != "installed" { bad = 1 } END { exit (bad || NR != 6) }'; then
+    info "Базовые пакеты уже установлены — пропускаю их загрузку" "Base packages already installed — skipping downloads"
+  else
+    info "Установка базовых пакетов" "Installing base packages"
+    apt_run update
+    apt_run install -y "${base_packages[@]}"
+  fi
 
   if ! command -v docker >/dev/null 2>&1; then
     info "Docker не найден — ставлю из официального репозитория Docker" "Docker not found — installing from the official Docker repository"
@@ -261,12 +272,12 @@ ensure_docker() {
     fi
     [ -n "$codename" ] || die "Не удалось определить кодовое имя релиза" "Cannot detect the release codename"
     install -m 0755 -d /etc/apt/keyrings
-    curl -fL "https://download.docker.com/linux/$distro/gpg" -o /etc/apt/keyrings/docker.asc
+    curl -fL --connect-timeout 15 --max-time 60 "https://download.docker.com/linux/$distro/gpg" -o /etc/apt/keyrings/docker.asc
     chmod a+r /etc/apt/keyrings/docker.asc
     printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n' \
       "$(dpkg --print-architecture)" "$distro" "$codename" >/etc/apt/sources.list.d/docker.list
-    apt-get update 2>&1 | tee -a "$LOG_FILE"
-    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>&1 | tee -a "$LOG_FILE"
+    apt_run update
+    apt_run install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   fi
 
   if command -v systemctl >/dev/null 2>&1; then systemctl enable --now docker 2>&1 | tee -a "$LOG_FILE" || true; fi
@@ -285,9 +296,13 @@ ensure_docker() {
 resolve_ref() {
   if [ -z "$REF" ]; then
     info "Ищу последний релизный тег nod-vX.Y.Z" "Looking for the latest release tag nod-vX.Y.Z"
-    REF="$(git ls-remote --tags --refs --sort=-v:refname "$NOD_REPO" 'nod-v*' 2>/dev/null \
-            | awk '{print $2}' | sed 's#refs/tags/##' \
-            | grep -E '^nod-v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
+    local tags
+    if ! tags="$(timeout 120 git ls-remote --tags --refs --sort=-v:refname "$NOD_REPO" 'nod-v*' \
+        2> >(tee -a "$LOG_FILE" >&2))"; then
+      die "Не удалось получить версии Nod за отведённое время. Подробности выше и в $LOG_FILE" \
+          "Could not retrieve Nod versions within the time limit. See the output and $LOG_FILE"
+    fi
+    REF="$(printf '%s\n' "$tags" | awk '$2 ~ /^refs\/tags\/nod-v[0-9]+\.[0-9]+\.[0-9]+$/ && !found { sub(/^refs\/tags\//, "", $2); print $2; found = 1 }')"
     [ -n "$REF" ] || die "Релизные теги не найдены. Укажите версию: --ref <тег|коммит>" "No release tags found. Pass one: --ref <tag|commit>"
   fi
   [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || die "Недопустимое значение --ref" "Invalid --ref value"
@@ -448,6 +463,13 @@ run_build() {
   viewer_pid=$!
   while [ ! -f "$status" ]; do
     sleep 2; waited=$((waited + 2))
+    if [ ! -f "$status" ] && ! kill -0 "$build_pid" 2>/dev/null; then
+      kill "$viewer_pid" 2>/dev/null || true
+      wait "$viewer_pid" 2>/dev/null || true
+      wait "$build_pid" 2>/dev/null || true
+      die "Процесс сборки завершился без результата. Подробности: $BUILD_LOG" \
+          "Builder exited without a result. See $BUILD_LOG"
+    fi
     if [ $((waited % 60)) -eq 0 ]; then
       info "Сборка продолжается: прошло ${waited} с" "Build still running: ${waited}s elapsed"
     fi
@@ -472,7 +494,7 @@ wait_http() { # url tries
   local code i
   for i in $(seq 1 "$2"); do
     code="$(curl -sS -o /dev/null -m 10 -w '%{http_code}' "$1" 2>/dev/null || true)"
-    case "$code" in 000|5??|"") ;; *) return 0 ;; esac
+    case "$code" in 2??|3??|401|403) return 0 ;; esac
     sleep 5
   done
   return 1
@@ -496,12 +518,18 @@ verify() {
 
 # ---- Самоустановка и cron-бэкап --------------------------------------------------
 install_self() {
-  local dst=/usr/local/sbin/nod-installer src="${BASH_SOURCE[0]:-}"
-  if [ -n "$src" ] && [ -f "$src" ] && [ -r "$src" ]; then cp -f "$src" "$dst"
-  else curl -fsSL -m 30 "$SELF_URL" -o "$dst" 2>/dev/null || { rm -f "$dst"; return 1; }
+  local dst=/usr/local/sbin/nod-installer src="${BASH_SOURCE[0]:-}" tmp
+  tmp="$(mktemp "${dst}.XXXXXX")" || return 1
+  if [ -n "$src" ] && [ -f "$src" ] && [ -r "$src" ]; then
+    cp "$src" "$tmp" || { rm -f "$tmp"; return 1; }
+  else
+    curl -fL --connect-timeout 15 --max-time 60 "$SELF_URL" -o "$tmp" \
+      || { rm -f "$tmp"; return 1; }
   fi
-  if ! head -n1 "$dst" | grep -q '^#!/usr/bin/env bash'; then rm -f "$dst"; return 1; fi
-  chmod 755 "$dst"
+  if ! head -n1 "$tmp" | grep -q '^#!/usr/bin/env bash' || ! bash -n "$tmp"; then
+    rm -f "$tmp"; return 1
+  fi
+  chmod 755 "$tmp" && mv -f "$tmp" "$dst" || { rm -f "$tmp"; return 1; }
 }
 
 schedule_backup() {
